@@ -1,0 +1,54 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "location": {
+      "value": "<input-your-azure-region>"
+    },
+    "instanceName": {
+      "value": "conductor-node1"
+    },
+    "instanceSize": {
+      "value": "Standard_F16s_v2"
+    },
+    "availabilityZone": {
+      "value": "2"
+    },
+    "availabilitySetName": {
+      "value": ""
+    },
+    "managedIdentity": {
+      "value": "<input-your-managed-identity-name>"
+    },
+    "managedIdentityResourceGroup": {
+      "value": ""
+    },
+    "virtualNetworkName": {
+      "value": "<input-your-vnet-name>"
+    },
+    "virtualNetworkResourceGroup": {
+      "value": ""
+    },
+    "controlSubnetName": {
+      "value": "<input-your-subnet-name>"
+    },
+    "controlPrivateIp": {
+      "value": "<input-node1-private-ip>"
+    },
+    "haPeerPrivateIp": {
+      "value": "<input-node0-private-ip>"
+    },
+    "createPublicIp": {
+      "value": false
+    },
+    "controlAllowedCidr": {
+      "value": "0.0.0.0/0"
+    },
+    "adminAllowedCidr": {
+      "value": "0.0.0.0/0"
+    },
+    "adminPublicKeyData": {
+      "value": "<input-your-ssh-public-key>"
+    }
+  }
+}

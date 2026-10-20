@@ -1,0 +1,25 @@
+#cloud-config
+# SSR HA conductor node0 - primary. Initialized standalone, node1 joins it later.
+# Pass to the deployment with: --parameters customData=@<this file>
+write_files:
+  - path: /etc/128T-hardware-bootstrapper/onboarding-config.json
+    owner: root:root
+    permissions: '0600'
+    content: |
+      {
+        "mode": "conductor",
+        "name": "Conductor-node0",
+        "node-name": "node0",
+        "cloud-provider": "azure",
+        "ssr-version": "7.2.3",
+        "artifactory-user": "<input-your-artifactory-username>",
+        "artifactory-password": "<input-your-artifactory-token>",
+        "admin-password": "<input-sha512-crypt-hash-of-admin-password>",
+        "root-password": "<input-sha512-crypt-hash-of-root-password>",
+        "t128-password": "<input-sha512-crypt-hash-of-t128-password>",
+        "pdc-key-comment": "Conductor-node0",
+        "initializer-overrides": {
+          "router-name": "Conductor",
+          "node-ip": "<input-node0-private-ip>"
+        }
+      }

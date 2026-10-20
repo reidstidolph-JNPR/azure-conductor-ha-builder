@@ -1,0 +1,183 @@
+# Highly Available SSR Conductor on Azure (BYOL, ARM template + cloud-init)
+
+Hand-off kit for deploying a **two-node highly available Session Smart conductor** (node0 + node1) in Azure from the BYOL marketplace image. The customer receives a MOP and five files, and runs a short series of single-line Azure CLI commands from Azure Cloud Shell. No scripts or tooling beyond the Azure CLI are required.
+
+References:
+- [Installing a BYOL Conductor in Azure - Cloud-init Onboarding](https://docs.128technology.com/docs/intro_installation_byol_azure_conductor#cloud-init-onboarding-1)
+- [Conductor High Availability for Cloud Deployments](https://docs.128technology.com/docs/intro_initialize_HA_conductor)
+- [Initialize Your Device - Advanced Workflows (initialize a conductor)](https://docs.128technology.com/docs/initialize_u-iso_adv_workflow/#initialize-a-conductor)
+
+## Hand-off bundle
+
+| File | Purpose |
+|---|---|
+| [MOP.md](./MOP.md) | Customer procedure: environment summary, prerequisites, and every command to run with its expected result. |
+| [conductor_template.json](./conductor_template.json) | ARM template for **one** conductor node (VM, NIC with static private IP, NSG, optional public IP). Deployed once per node. |
+| [conductor-node0-params.json](./conductor-node0-params.json) | Template parameters for node0. |
+| [conductor-node1-params.json](./conductor-node1-params.json) | Template parameters for node1. |
+| [conductor-node0-cloud-init.txt](./conductor-node0-cloud-init.txt) | cloud-init that writes node0's `onboarding-config.json` (first HA node). |
+| [conductor-node1-cloud-init.txt](./conductor-node1-cloud-init.txt) | cloud-init that writes node1's `onboarding-config.json` (joins node0 with `learn-from-ha-peer`). |
+
+The files in this directory are samples with `<input-...>` placeholders. To customize them, open [webapp/index.html](./webapp/index.html), a single-page builder for professional services: fill in the form and click **Download all (.zip)** to get the customized MOP and the five files. Alternatively, replace the placeholders by hand using the [inputs reference](#inputs-reference).
+
+## Deploying with cloud-init in one command
+
+`az deployment group create` has no `--custom-data` option (that option belongs to `az vm create`). Instead, the template exposes the cloud-init as a `customData` **secureString** parameter and base64-encodes it into the VM's `osProfile.customData`. The Azure CLI `name=@file` syntax loads a file's content into a parameter, so each node is a single command:
+
+```powershell
+az deployment group create --resource-group '<rg>' --name 'ssr-conductor-node0' --template-file 'conductor_template.json' --parameters '@conductor-node0-params.json' 'customData=@conductor-node0-cloud-init.txt'
+```
+
+In PowerShell, quote every argument that starts with `@`, otherwise PowerShell treats it as splatting. In Bash the quotes are optional. Because `customData` is a secureString, the cloud-init content (repository token, temporary password) is not stored in the deployment history.
+
+## How the HA pair is formed
+
+In Azure each conductor node has a **single control interface**, which also carries HA sync. The MOP follows the documented cloud HA procedure:
+
+1. **node0** is deployed. On first boot the hardware bootstrapper reads the onboarding config written by cloud-init, installs the requested SSR version, and runs the initializer as a conductor. The `initializer-overrides` set the router name and `node-ip`.
+2. **node0 is opened to node1 temporarily.** node1's initializer must log in to node0 as `t128` with a password, and its `sudo` must prompt for that password (the initializer's SFTP session fails with passwordless sudo). Azure images disable password SSH and grant `t128` passwordless sudo, so one `az vm run-command` line sets the temporary password, moves cloud-init's NOPASSWD sudoers file aside, and allows password SSH for `t128` **only from node1's IP**. This automates "Configure Node A" in the HA doc.
+3. **node1** is deployed with `learn-from-ha-peer`. Its initializer logs in to node0, exchanges SSH keys, adds node1 to node0's `global.init`, and copies the environment and salt master keys.
+4. **node0 is closed again.** One `az vm run-command` line removes the SSH exception, restores sudoers, and resets `t128` to the password hash from the onboarding config. node0 is then restarted so it recognizes node1.
+
+Progress is checked with an `az vm run-command` status line that prints `STATE=INSTALLING|BOOTSTRAPPING|READY|FAILED` plus the conductor list in `global.init`. node1 must not be deployed before node0 is READY and step 2 is done: the initializer checks the peer login once and the bootstrapper does not retry.
+
+### What changed from the original sample files
+
+- The template took no cloud-init: it hard-coded its own `customData` (always `node-name: node0`, no HA). It now takes the cloud-init through the `customData` parameter. The `SSR Version`/artifactory parameters moved into the cloud-init, so each value has a single source.
+- `admin-password`, `root-password` and `t128-password` must be **SHA-512 crypt hashes** (`$6$salt$hash`); clear-text values fail the onboarding schema. BYOL also requires `ssr-version` and `cloud-provider: azure`.
+- `clustered: true` (from the hardware/USB example) requires a dedicated HASync NIC using `169.254.253.x`, which is not usable in an Azure VNet. In Azure, HA is configured through `initializer-overrides`, which are passed straight to `initialize128t`: `node-ip` on both nodes, plus `ha-peer-ip`, `ha-peer-name`, `learn-from-ha-peer`, `ha-peer-username` and `unsafe-ha-peer-password` on node1. The single Azure NIC is `ge-0-0`, so `interface-name: ge-0-1` is gone too.
+- `node-ip` must be known before deployment, so the NIC now uses a **static private IP** (`controlPrivateIp`). Each NSG allows all traffic from the HA peer (`haPeerPrivateIp`).
+- Both nodes were pinned to zone `2`. The zone is now a parameter (node0 zone 1, node1 zone 2 by default; leave it empty and use `availabilitySetName` where zones are unavailable).
+- Each node's `name` (hostname / salt minion ID) is `<router name>-node0` / `-node1`, so the nodes do not collide. The real router name is set through `initializer-overrides.router-name`, mirroring the bootstrapper's own hardware HA behavior.
+- Smaller fixes: the template's `commandToExecute` was the literal string `['usermod -a -G wheel t128']`, and the extension location now follows the `location` parameter. Optional parameters were added for the VNet / identity resource groups and a public IP.
+
+### Onboarding config differences between the nodes
+
+node0:
+
+```json
+"initializer-overrides": {
+  "router-name": "Conductor",
+  "node-ip": "<node0 private IP>"
+}
+```
+
+node1:
+
+```json
+"initializer-overrides": {
+  "router-name": "Conductor",
+  "node-ip": "<node1 private IP>",
+  "ha-peer-ip": "<node0 private IP>",
+  "ha-peer-name": "node0",
+  "learn-from-ha-peer": true,
+  "ha-peer-username": "t128",
+  "unsafe-ha-peer-password": "<temporary password>"
+}
+```
+
+## Inputs reference
+
+Every input, what it is, and where it goes. The web app shows the same information next to each form field. "File: key" uses dotted paths for the JSON inside the cloud-init files (for example `initializer-overrides.node-ip`).
+
+<!-- INPUTS-TABLE:BEGIN -->
+#### Azure deployment (shared by both nodes)
+
+| # | Input | Required | Default | Description | File: key |
+|---|---|---|---|---|---|
+| 1 | Resource group | Yes | - | Existing resource group the conductor VMs, NICs, NSGs (and optional public IPs) are created in. Placeholder: `<input-your-resource-group>` | `MOP.md: --resource-group of every az command` |
+| 2 | Azure region | Yes | - | Region of the VNet, lowercase with no spaces (e.g. eastus, westeurope). Placeholder: `<input-your-azure-region>` | `conductor-node0-params.json: location`<br>`conductor-node1-params.json: location` |
+| 3 | VNet name | Yes | - | Existing VNet both conductor nodes are attached to. Placeholder: `<input-your-vnet-name>` | `conductor-node0-params.json: virtualNetworkName`<br>`conductor-node1-params.json: virtualNetworkName` |
+| 4 | VNet resource group | No | (empty) | Only needed when the VNet lives in a different resource group. Empty = deployment resource group. | `conductor-node0-params.json: virtualNetworkResourceGroup`<br>`conductor-node1-params.json: virtualNetworkResourceGroup` |
+| 5 | Control subnet name | Yes | - | Existing subnet for the control interface of both nodes. Routers must reach it; both nodes must reach each other. Placeholder: `<input-your-subnet-name>` | `conductor-node0-params.json: controlSubnetName`<br>`conductor-node1-params.json: controlSubnetName` |
+| 6 | User assigned managed identity | Yes | - | Identity attached to both VMs. Needs Microsoft.Compute/virtualMachines/read, Microsoft.Network/networkInterfaces/read and Microsoft.Network/virtualNetworks/read. Placeholder: `<input-your-managed-identity-name>` | `conductor-node0-params.json: managedIdentity`<br>`conductor-node1-params.json: managedIdentity` |
+| 7 | Managed identity resource group | No | (empty) | Only needed when the identity lives in a different resource group. Empty = deployment resource group. | `conductor-node0-params.json: managedIdentityResourceGroup`<br>`conductor-node1-params.json: managedIdentityResourceGroup` |
+| 8 | VM size | No | `Standard_F16s_v2` | Size of both conductor VMs. | `conductor-node0-params.json: instanceSize`<br>`conductor-node1-params.json: instanceSize` |
+| 9 | Availability set name | No | (empty) | Existing availability set for regions without availability zones. Leave empty when using zones. | `conductor-node0-params.json: availabilitySetName`<br>`conductor-node1-params.json: availabilitySetName` |
+| 10 | Create a public IP per node | No | `false` | Attach a static Standard SKU public IP to each control interface (needed when routers reach the conductor over the Internet). | `conductor-node0-params.json: createPublicIp`<br>`conductor-node1-params.json: createPublicIp` |
+| 11 | Admin allowed CIDR | No | `0.0.0.0/0` | Source range allowed SSH (22) and HTTPS (443) to the conductor. Restrict this where possible. | `conductor-node0-params.json: adminAllowedCidr`<br>`conductor-node1-params.json: adminAllowedCidr` |
+| 12 | Router control allowed CIDR | No | `0.0.0.0/0` | Source range of the managed routers (ports 930, 933, 4505-4506). | `conductor-node0-params.json: controlAllowedCidr`<br>`conductor-node1-params.json: controlAllowedCidr` |
+| 13 | SSH public key for t128 | Yes | - | Public key (ssh-rsa, at least 2048-bit) used to log in as t128 on both nodes. Placeholder: `<input-your-ssh-public-key>` | `conductor-node0-params.json: adminPublicKeyData`<br>`conductor-node1-params.json: adminPublicKeyData` |
+
+#### Conductor nodes
+
+| # | Input | Required | Default | Description | File: key |
+|---|---|---|---|---|---|
+| 14 | node0 VM name | No | `conductor-node0` | Azure VM name of the primary node (also prefixes its NIC/NSG/disk names). | `conductor-node0-params.json: instanceName`<br>`MOP.md: --name of node0 az vm commands` |
+| 15 | node0 private IP | Yes | - | Free static IP in the control subnet for node0. It is node0's conductor address and its HA address. Placeholder: `<input-node0-private-ip>` | `conductor-node0-params.json: controlPrivateIp`<br>`conductor-node1-params.json: haPeerPrivateIp`<br>`conductor-node0-cloud-init.txt: initializer-overrides.node-ip`<br>`conductor-node1-cloud-init.txt: initializer-overrides.ha-peer-ip` |
+| 16 | node0 availability zone | No | `1` | Zone of node0. Empty when the region has no zones (use an availability set instead). | `conductor-node0-params.json: availabilityZone` |
+| 17 | node1 VM name | No | `conductor-node1` | Azure VM name of the secondary node. | `conductor-node1-params.json: instanceName`<br>`MOP.md: --name of node1 az vm commands` |
+| 18 | node1 private IP | Yes | - | Free static IP in the control subnet for node1. Placeholder: `<input-node1-private-ip>` | `conductor-node1-params.json: controlPrivateIp`<br>`conductor-node0-params.json: haPeerPrivateIp`<br>`conductor-node1-cloud-init.txt: initializer-overrides.node-ip`<br>`MOP.md: step 5 (sshd Match Address)` |
+| 19 | node1 availability zone | No | `2` | Zone of node1. Use a different zone than node0. | `conductor-node1-params.json: availabilityZone` |
+
+#### SSR software and conductor identity
+
+| # | Input | Required | Default | Description | File: key |
+|---|---|---|---|---|---|
+| 20 | Conductor (router) name | No | `Conductor` | Name of the conductor router. Each node also gets the hostname &lt;name&gt;-node0 / &lt;name&gt;-node1. | `conductor-node0-cloud-init.txt: initializer-overrides.router-name, name, pdc-key-comment`<br>`conductor-node1-cloud-init.txt: initializer-overrides.router-name, name, pdc-key-comment` |
+| 21 | SSR version | No | `7.2.3` | SSR software version installed on both nodes (6.3.0 or later). | `conductor-node0-cloud-init.txt: ssr-version`<br>`conductor-node1-cloud-init.txt: ssr-version` |
+| 22 | Artifactory username | Yes | - | Juniper software repository user used to download SSR. Placeholder: `<input-your-artifactory-username>` | `conductor-node0-cloud-init.txt: artifactory-user`<br>`conductor-node1-cloud-init.txt: artifactory-user` |
+| 23 | Artifactory token | Yes | - | Token/password for the artifactory user. Placeholder: `<input-your-artifactory-token>` | `conductor-node0-cloud-init.txt: artifactory-password`<br>`conductor-node1-cloud-init.txt: artifactory-password` |
+
+#### Account passwords (SHA-512 crypt hashes)
+
+| # | Input | Required | Default | Description | File: key |
+|---|---|---|---|---|---|
+| 24 | admin password hash | Yes | - | SHA-512 crypt hash ($6$...) for the SSR admin account (PCLI/GUI). Never a clear-text password. Placeholder: `<input-sha512-crypt-hash-of-admin-password>` | `conductor-node0-cloud-init.txt: admin-password`<br>`conductor-node1-cloud-init.txt: admin-password` |
+| 25 | root password hash | Yes | - | SHA-512 crypt hash for the Linux root account. Placeholder: `<input-sha512-crypt-hash-of-root-password>` | `conductor-node0-cloud-init.txt: root-password`<br>`conductor-node1-cloud-init.txt: root-password` |
+| 26 | t128 password hash | Yes | - | SHA-512 crypt hash for the Linux t128 account (SSH still uses the key). Also restores t128 on node0 after node1 joins. Placeholder: `<input-sha512-crypt-hash-of-t128-password>` | `conductor-node0-cloud-init.txt: t128-password`<br>`conductor-node1-cloud-init.txt: t128-password`<br>`MOP.md: step 8 (restore t128 password)` |
+
+#### HA peer bootstrap credentials (temporary)
+
+| # | Input | Required | Default | Description | File: key |
+|---|---|---|---|---|---|
+| 27 | Temporary HA peer password | Yes | - | Clear-text, single-use password for t128 on node0. Valid only between MOP steps 5 and 8 while node1 joins. Use a unique, strong value. Placeholder: `<input-temporary-ha-peer-password>` | `conductor-node1-cloud-init.txt: initializer-overrides.unsafe-ha-peer-password`<br>`MOP.md: step 5 (temporary t128 password on node0)` |
+
+#### Optional settings
+
+| # | Input | Required | Default | Description | File: key |
+|---|---|---|---|---|---|
+| 28 | DNS servers | No | (empty) | Comma separated IPv4 DNS servers. Empty = bootstrapper defaults (8.8.8.8, 1.1.1.1). Azure DNS is 168.63.129.16. | `conductor-node0-cloud-init.txt: dns-servers`<br>`conductor-node1-cloud-init.txt: dns-servers` |
+| 29 | NTP servers | No | (empty) | Comma separated NTP servers (IP or hostname). Empty = bootstrapper defaults. | `conductor-node0-cloud-init.txt: ntp-servers`<br>`conductor-node1-cloud-init.txt: ntp-servers` |
+| 30 | Timezone | No | (empty) | Optional IANA timezone for both nodes, e.g. America/New_York. | `conductor-node0-cloud-init.txt: initializer-overrides.timezone`<br>`conductor-node1-cloud-init.txt: initializer-overrides.timezone` |
+| 31 | Customer / project name | No | (empty) | Shown in the MOP title and summary. | `MOP.md: title` |
+<!-- INPUTS-TABLE:END -->
+
+Values that are **not inputs** but are fixed by design: `mode: conductor`, `cloud-provider: azure`, `node-name` (`node0`/`node1`), the VM admin user `t128` (also the HA peer user), `ha-peer-name: node0` and `learn-from-ha-peer: true` on node1, and the `customData` template parameter (the cloud-init file itself).
+
+### Generating password hashes
+
+The web app has a **Generate…** button next to each hash field; hashes are computed locally in the browser. From a shell:
+
+```bash
+openssl passwd -6                          # OpenSSL 1.1.1 or later, prompts for the password
+mkpasswd -m sha-512                        # Debian/Ubuntu "whois" package
+python3 -c 'import crypt,getpass; print(crypt.crypt(getpass.getpass(), crypt.mksalt(crypt.METHOD_SHA512)))'   # Python 3.12 or earlier
+```
+
+The temporary HA peer password is the only clear-text secret. It is valid on node0 only between MOP steps 5 and 8. Use a unique value.
+
+## Security notes
+
+- The cloud-init files contain the repository token and (node1) the temporary HA peer password. Deliver them over a secure channel and delete them from Cloud Shell afterwards. The run-command lines in MOP steps 5 and 8 also embed the temporary password and the t128 hash, so the MOP itself must be handled as confidential.
+- After step 8 the temporary password no longer works on node0. Root-only copies of node1's onboarding data on node1 still contain it, but they cannot be used to log in anywhere.
+- `adminAllowedCidr` and `controlAllowedCidr` default to `0.0.0.0/0`, the same as the original template. Narrow them, especially when `createPublicIp` is true.
+
+## Web app (professional services builder)
+
+[webapp/index.html](./webapp/index.html) is a self-contained page. Open it from disk in a modern browser; it makes no network requests. It has three tabs:
+
+- **Usage**: this guide.
+- **Inputs**: a form with validation, a password-hash generator, and the file/key each value is written to. **Export inputs** saves the form without secrets.
+- **Files & commands**: the customized MOP and the five deployment files as expandable panels, each with **Copy** and **Download**. MOP.md opens in a readable rendered view with a **Raw markdown** toggle. JSON (and the JSON inside the cloud-init files) is syntax highlighted, and unfilled placeholders are marked. **Download all (.zip)** produces the hand-off bundle, and every MOP command is listed with a copy button.
+
+### Maintaining the web app
+
+`webapp/index.html` is built from `index.src.html`, `generator.js` and `app.js`, and embeds `conductor_template.json` and this README. The sample bundle files and the inputs table above are generated from the same field definitions the web app uses.
+
+```bash
+cd webapp
+node test_generator.js --write   # regenerate MOP.md, the sample node files, and the README inputs table
+python3 build.py                 # rebuild webapp/index.html
+node test_generator.js           # verify samples, README, MOP command quoting, crypto, zip and index.html
+```
